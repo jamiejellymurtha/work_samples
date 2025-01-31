@@ -1,0 +1,458 @@
+---
+title: "Homework 2"
+subtitle: "PPOL 6811-10: Advanced Econometrics"
+author: "Jamie Jelly Murtha"
+format: 
+  html:
+    code-line-numbers: true
+    body-width: 1600px
+    embed-resources: true
+editor_options: 
+  chunk_output_type: console
+execute:
+  warning: false
+urlcolor: blue
+toc: true
+editor: 
+  markdown: 
+    wrap: sentence
+---
+
+# Setup
+
+#### Initial Setup
+
+I ran the "ipums1980.do" file in Stata, saved the result as "hw2.dta", and used it as my data file for this script.
+
+```{r}
+
+# load libraries
+library(tidyverse)
+library(haven)
+library(knitr)
+library(kableExtra)
+library(broom)
+library(sandwich)
+library(lmtest)
+library(priceR)
+
+# turn off scientific notation
+options(scipen = 999)
+
+# set working directory
+setwd(paste0("/Users/jamiejellymurtha/Desktop/iCloud/Georgetown/Quant Sequence",
+             "/Quant IV/HW/HW2/hmk2"))
+
+# load data
+data <- read_dta("hw2.dta")
+
+```
+
+# Question 1.1
+
+#### Create Function to Obtain Inflation Data to Adjust Wages to 2003 US Dollars
+
+```{r}
+#| output: false
+
+# set up function to obtain inflation-adjusted inctot
+infl_adj_US <- function(value,
+                        nominal_date,
+                        adj_date,
+                        inflation_df,
+                        countries_df) {
+  
+  # set up conversion from nominal price to other year's price
+new_value <- adjust_for_inflation(price = value,
+                                  from_date = nominal_date,
+                                  country = "US",
+                                  to_date = adj_date,
+                                  inflation_dataframe = inflation_df,
+                                  countries_dataframe = countries_df)
+return(new_value)
+  }
+
+# create inputs for fn
+inflation_df_input <- retrieve_inflation_data("US")
+countries_df_input <- show_countries()
+
+```
+
+#### Create Round Up Function
+
+```{r}
+
+# create function to round up at 5
+roundup <- function(value, digits) {
+  sign = sign(value)
+  num = abs(value)*10^digits
+  num = num + 0.5 + sqrt(.Machine$double.eps)
+  num = trunc(num)
+  num = num/10^digits
+  num*sign
+}
+
+```
+
+#### Prepare and Clean the Data
+
+```{r}
+
+# clean the data and create new variables
+data <- data |>
+  # keep men
+  filter(sex == 1,
+         # keep only ages 40 - 49
+         age >= 40,
+         age <= 49,
+         # keep only white race across all race variables
+         race == 1,
+         raced == 100,
+         racesing == 1,
+         racesingd == 10,
+         # keep only individuals who worked
+         wkswork1 > 0,
+         # remove entries with NAs
+         is.na(wkswork1) == FALSE,
+         is.na(inctot) == FALSE) |>
+  # create inflation-adjusted wage variable
+  mutate(ia_inctot = map_dbl(.x = inctot,
+                             nominal_date = 1980,
+                             adj_date = 2003,
+                             inflation_df = inflation_df_input,
+                             countries_df = countries_df_input,
+                             .f = infl_adj_US),
+         # create weekly wages variable
+         wkly_wages = ia_inctot / wkswork1,
+         # create log of weekly wages
+         log_wkly_wages = log(wkly_wages),
+         # create variable for number of years of education
+         # recode 0 and 1 as 0 years of education, per labels in ipums1980.do
+         schooling = case_when(higrade <= 1 ~ 0,
+                               # subtract one year from each subsequent code to
+                               # correctly reflect number of years of schooling
+                               higrade >= 2 & higrade <= 20 ~ higrade - 1,
+                               # combine schooling of 20 or more years into one
+                               # group
+                               higrade >= 21 ~ 20,
+                               TRUE ~ NA)) |>
+  # remove rows with NaN, Inf, and -Inf values in log weekly wage values
+  filter(!(log_wkly_wages %in% c("NaN", "Inf", "-Inf")))
+
+```
+
+#### Recreate MHE Figure 3.1.1 Using Conditional Expectation Function (CEF) Output
+
+```{r}
+
+# calculate cef of log weekly earnings given schooling
+cef_earnings_schooling <- data |>
+  group_by(schooling) |>
+  summarize(count = n(),
+            mean_log_wkly_wages = mean(log_wkly_wages)) |>
+  mutate(schooling_label = ifelse(schooling == 20, "20+",
+                            schooling))
+
+# capture mean log wages at max and min of schooling
+max_min_cef <- cef_earnings_schooling |>
+  filter(schooling_label %in% c("0", "20+")) |>
+  mutate(mean_wages = roundup(exp(mean_log_wkly_wages), 2))
+
+cef_0 <- max_min_cef$mean_wages[1]
+cef_20_plus <- max_min_cef$mean_wages[2]
+
+# recreate MHE figure 3.1.1 using cef data 
+fig_3_1_1 <- ggplot(data = cef_earnings_schooling, mapping = aes(
+  x = schooling,
+  y = mean_log_wkly_wages)) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous(
+    breaks = c(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20),
+    limits = c(0,20),
+    labels = c("0", "2", "4", "6", "8", "10", "12", "14", "16", "18", "20+")) +
+  scale_y_continuous(
+    breaks = c(5.0, 5.4, 5.8, 6.2, 6.6, 7.0, 7.4, 7.8),
+    limits = c(5.0, 7.8)) +
+  labs(x = "\nYears of Completed Education",
+       y = "Log Weekly Earnings, $2003\n",
+       title = paste0("Conditional Expectation Function of Average Log Weekly",
+                      " Wages Given\nSchooling"),
+       subtitle = "White Men Ages 40-49, 1980",
+       caption = "Source: IPUMS 1980 5 Percent Data")
+  
+# print figure 3.1.1
+fig_3_1_1
+
+# print cef table
+kable(cef_earnings_schooling |>
+        select(schooling_label, mean_log_wkly_wages),
+      col.names = c("Years of Completed Education",
+                    "Average Log Weekly Wages"),
+      caption = paste0("Conditional Expectation Function of Average Log Weekly",
+                       " Wages of Employed White Men Ages 40-49, Given",
+                       " Schooling, 1980 IPUMS 5% Data"))
+
+
+
+```
+
+An imperfect recreation of the authors' data produces the above conditional expectation function (CEF) of average log weekly wages given years of schooling. These data follow the general trend of returns to education observed in MHE Figure 3.1.1. Above, given 0 years of schooling, we would expect an individual to earn, on average, about \$440.93 a week in 2003 US dollars. Conversely, we would expect an individual with 20 or more years of education to earn, on average, about \$1327.07 a week in 2003 US dollars.
+
+# Question 1.2
+
+#### Recreate MHE Figure 3.1.3, First Regression
+
+```{r}
+
+# regress log weekly wages on schooling (top regression in figure 3.1.3)
+first_reg <- lm(
+  # Y
+  log_wkly_wages ~
+    # X
+    schooling,
+  # data
+  data = data)
+
+# review the lm model
+summary(first_reg)
+
+# calculate robust standard errors
+coeftest(first_reg, vcov = vcovHC(first_reg, "HC1"))
+
+```
+
+#### Recreate MHE Figure 3.1.3, Second Regression using CEF Values and Weights
+
+```{r}
+
+# regress the cef on schooling (bottom regression in figure 3.1.3)
+sec_reg <- lm(
+  # Y
+  mean_log_wkly_wages ~
+    # X
+    schooling,
+  # data
+  data = cef_earnings_schooling,
+  #weights
+  weights = count)
+
+# review the lm model
+summary(sec_reg)
+
+# calculate robust standard errors
+coeftest(sec_reg, vcov = vcovHC(sec_reg, "HC1"))
+
+```
+
+The first regression above employs the full dataset of about 443,000 observations to regress log weekly earnings on schooling. The second regression employs a dataset with just 21 observations--the mean log weekly wage at each year of schooling--to regress the former on the latter, but this regression is weighted by the count of observations with each number of years of schooling. These regressions produce the same slope coefficient (approximately 5.86) and intercept (approximately 0.07).
+<br><br>
+Under the CEF Decomposition Property, any random variable *Y~i~* can be broken down into a portion that is *explained by X~i~*, which is the CEF, and a portion that is uncorrelated with (or orthogonal to) any function of *X~i~*:
+
+$$Y_i = E[Y_i | X_i] + ε_i,~where:$$
+$$1.~ε_i~is~mean~independent~of~X_i,~meaning~E[ε_i | X_i] = 0:$$
+$$E[ε_i | X_i] = E[Y_i - E[Y_i | X_i]|X_i] = E[Y_i | X_i] - E[Y_i | X_i] = 0$$
+
+$$2.~Therefore,~ε_i~is~uncorrelated~with~any~function~of~X_i:$$
+$$Let~h(X_i)~be~any~function~of~X_i.~By~the~Law~of~Iterated~Expectations,~E[h(X_i)ε_i] = E\{h(X_i)E[ε_i | X_i]\}$$
+$$By~mean~independence,~E[ε_i | X_i] = 0$$
+<br>
+As a consequence of the CEF Decomposition Property, the CEF Prediction Property states that the CEF is the best predictor of *Y~i~* given *X~i~*, in the sense that it solves the minimum mean squared error prediction problem. If we let *m(X~i~)* be any function of *X~i~*, the CEF solves:
+
+$$E[Y_i | X_i] = arg~min_{m(X_i)}~E[(Y_i - m(X_i)^2]$$
+meaning it is the the minimum mean squared error predictor of *Y~i~* given *X~i~*:
+
+$$(Y_i - m(X_i))^2 = ((Y_i - E[Y_i | X_i]) + E[Y_i | X_i] - m(X_i)))^2$$
+$$= (Y_i - E[Y_i | X_i])^2 + 2(E[Y_i | X_i] - m(X_i))~*~(Y_i - E[Y_i | X_i]) + (E[Y_i | X_i] - m(X_i))^2$$
+The first term above does not include *m(X~i~)*, so it is irrelevant. The second term can be written equivalently as *h(X~i~)ε~i~*, where *h(X~i~)* is the same as *2(E[Y~i~ | X~i~] - m(X~i~))*; by the CEF Decomposition Property, it has an expectation of 0. The final term is minimized at 0 when *m(X~i~)* is the CEF.
+<br>
+
+Under the Linear CEF Theorem, if we suppose that the CEF is linear, it is in fact the population regression. But given that the trend of the reproduction of MHE Figure 3.1.1 above is a bit bumpy, we may not be comfortable assuming linearity in the relationship between log weekly earnings and years of schooling. The Best Linear Predictor Theorem and the Regression CEF Theorem tell us that even if the CEF is non-linear, regression produces the best linear approximation to it.
+<br>
+
+The Best Linear Predictor Theorem states that the function *X'~i~β* is the best linear predictor of *Y~i~*, given *X~i~*, in a minimum mean squared error sense. Just as the CEF is the best predictor of *Y~i~* given *X~i~*, in a mean squared error sense, in the class of all functions of *X~i~*, the population regression function provides the closest approximation to the CEF among linear functions:
+
+$$β = E[X_iX'_i]^{-1}~E[X_iY_i]~solves~the~population~least~squares~problem$$
+<br>
+The Regression CEF Theorem states that the function *X'~i~β* provides the minimum mean squared error linear approximation to the CEF (*E[Y~i~ | X~i~]*):
+
+$$β = arg~min_b~E\{(E[Y_i | X_i] - X'_ib)^2\}$$
+$$(Y_i - X'_ib)^2 = \{(Y_i - E[Y_i | X_i]) + (E[Y_i | X_i] - X'_ib) \}^2$$
+$$= (Y_i - E[Y_i | X_i])^2 + (E[Y_i | X_i] - X'_ib)^2 + 2(Y_i - E[Y_i | X_i])(E[Y_i | X_i] - X'_ib)$$
+Above, the first term is irrelevant because it does not include *b*. By the CEF Decomposition Property, the last term has an expectation of 0. But the second term is minimized by *β*. The Regression CEF Theorem implies that regression coefficients can be obtained by actually using *E[Y~i~ | X~i~]*--*the CEF*--as a dependent variable instead of *Y~i~* itself in a regression. *β* can be constructed from the weighted least squares regression of *E[Y~i~|X~i~ = u]* on *u*, where *u* runs over the values taken on by *X~i~*. The weights are given by the distribution of *X~i~*, *g~x~(u)*. This can be observed as well if we iterate expectations in the formula for *β*:
+
+$$β = E[X_iX'_i]^{-1}~E[Y_i | X_i] = E[X_iX'_i]^{-1}~E[X_iE(Y_i | X_i)]$$
+Note that the two regressions do not have identical standard errors. This occurs because the standard errors from the grouped data regression (the second regression) don't measure the asymptotic sampling variance of the slope estimate in repeated micro-data samples.
+
+# Question 1.3
+
+#### Use ANOVA Formula to Decompose Variance
+
+##### First, calculate the variance of the CEF. This term captures the variance in *Y~i~* explained by the covariate *schooling* (derived from the sum of squares regression formula (SSR)):
+
+```{r}
+
+# calculate mean of log weekly wages
+mean_log_weekly_wages <- mean(data$log_wkly_wages)
+
+# prep data to calculate
+data <- data |>
+  # calculate mean of log weekly wages
+  mutate(mean_log_wkly_wages = mean_log_weekly_wages,
+         # get the fitted values from first regression
+         y_hat = fitted(first_reg),
+         # calculate the difference between mean wages and y_hats
+         mean_diff = y_hat - mean_log_wkly_wages,
+         # square the difference
+         sq_mean_diff = mean_diff^2)
+
+# calculate variance of CEF
+cef_var <- sum(data$sq_mean_diff) / (nrow(data) - 2)
+
+# print variance of CEF
+kable(cef_var,
+      col.names = "Variance of the Conditional Expectation Function")
+
+```
+
+##### Then calculate the expectation of the conditional variance of *Y~i~* given *X~i~*. This term captures the variance in *Y~i~* unexplained by the covariate *schooling* (derived from the sum of squared errors formula (SSE)):
+
+```{r}
+
+# prep data to calculate
+data <- data |>
+  # get expectation of Y given X for each value of x, aka fitted values
+  mutate(y_hat = fitted(first_reg),
+         # get residuals (difference between Y and Y_hat) for each value of x
+         residual = log_wkly_wages - y_hat,
+         # square the residuals
+         residual_sq = residual^2)
+
+# calculate
+cond_var <- tibble(
+  # calculate expectation of conditional variance of Y_i given X_i by hand
+  cond_var_byhand = (sum(data$residual_sq)) / (nrow(data) - 2),
+  # calculate using r function for comparision
+  cond_var_r = var(residuals(first_reg)),
+  # compare results
+  # observe var() fn uses only (n - 1) dof
+  diff = cond_var_byhand - cond_var_r)
+
+# keep expectation of conditional variance calculated by hand with (n - 2) dof
+exp_cond_var <- cond_var$cond_var_byhand
+
+# print expectation of conditional variance 
+kable(exp_cond_var,
+      col.names = paste0("Expectation of the Conditional Variance of Y\u0069",
+                         " given X\u0069"))
+
+```
+
+##### Finally, sum the variance of the CEF and the expectation of the conditional variance of *Y~i~* given *X~i~* (derived from SST):
+
+```{r}
+
+# calculate simple variance of Y_i
+var_yi <- cef_var + exp_cond_var
+
+kable(var_yi,
+      col.names = paste0("Variance of Y\u0069 as the Sum of the Variance of",
+                         " the CEF and the Expectation of the Conditional",
+                         " Variance of Y\u0069 Given X\u0069"))
+
+```
+
+##### Compare these results to calculations that employ the SSR and SSE produced by the ANOVA function (identical):
+
+```{r}
+
+# run anova results
+anova <- tidy(anova(first_reg))
+
+# print anova results
+kable(anova,
+      caption = "ANOVA Call Results")
+
+# calculate variance
+anova_var <- (anova$sumsq[1] + anova$sumsq[2]) / (nrow(data) - 2)
+
+# print anova variance
+kable(anova_var,
+      col.names = paste0("Variance of Y\u0069 Calculated Using ANOVA Call's",
+                         " SSR and SSE, for Comparison"))
+
+# simple calculation below produces nearly identical result
+# var_y_alone <- var(data$log_wkly_wages)
+
+```
+
+##### We can use the sum of squares regression (SSR) and sum of squared errors (SSE) from the ANOVA output above to calculate the *R^2*:
+
+```{r}
+
+# calculate R^2
+R2 <- anova$sumsq[1] / (sum(anova$sumsq))
+
+# print R^2
+kable(R2,
+      col.names = "R Squared")
+
+```
+
+Under the ANOVA Theorem, the variance of *Y~i~* equals a) the variance of the CEF plus b) the variance of *ε~i~*, which is equal to the expectation of the conditional variance of *Y~i~* given *X~i~*:
+
+$$1.~~Under~the~CEF~Decomposition~Property,~Y_i = E[Y_i | X_i] + ε_i:$$
+$$A.~~Therefore,~the~variance~of~Y_i~is~equal~to:~V[Y_i] = V[E[Y_i | X_i]] + V[ε_i] + 2COV[ε_i, E[Y_i | X_i]]$$
+$$B.~~Because~~E[ε_i | X_i] = 0~by~mean~independence,$$
+$$C.~~V[Y_i] = V[E[Y_i | X_i]] + V[ε_i]$$
+<br>
+$$2.~~Further,~~V[ε_i] = E[V[Y_i | X_i]]:$$
+$$ A.~~E[ε_i | X_i] = 0~for~each~X_i,~which~means~that~E[ε_i] =0;~then~V[ε_i] = E[ε^2_i]$$
+$$B.~~Then~by~the~Law~of~Iterated~Expectations,~E[ε^2_i] = E[E[ε^2_i | X_i]]$$
+$$C.~~Lastly,~since~ε_i~is~really~just~Y_i - E[Y_i | X_i],~E[E[ε^2_i | X_i]] = E[V[Y_i | X_i]]:$$
+$$V[ε_i] = E[ε^2_i] = E[E[E[ε^2_i | X_i]] = E[V[Y_i | X_i]]$$
+
+$$3.~~Therefore,~~V[Y_i] = V[E[Y_i | X_i]] + E[V[Y_i | X_i]]$$
+The variance of the conditional expectation function of log weekly wages given schooling is approximately 0.058. The variance of the expectation of the conditional variance of log weekly wages given schooling is approximately 0.42. Summing these two values together, we find that the total variance in log weekly wages is approximately 0.48. While the variance of the CEF captures the variance in log weekly wages explained by schooling, the conditional variance of log weekly wages given schooling captures the variance in log weekly wages unexplained by schooling. The former is derived from the sum of squares regression, while the latter is derived from the sum of squared errors.
+
+<br>
+Likewise, we can use these values to calculate the *R^2* of the regression model. This formula divides the sum of squares regression (SSR) (which provides a measure of the variance in log weekly wages explained by a regression of log weekly wages on schooling) by the sum of squares total (SST) (a measure of the total variability in the data). In other words, the *R^2* communicates the share of total variability in log weekly wages explained by schooling. Ultimately, schooling explains approximately 12.2% of the variability in log weekly wages. (*R^2* = 0.121996)
+
+# Question 1.4
+
+MHE Table 3.2.1 provides estimates of the returns to education for men in the NLSY data. The first column demonstrates that a short regression of log wages on years of schooling estimates that, on average, every additional year of schooling is associated with about a 13.2 percentage point increase in wages, holding no other variables constant.
+<br><br>
+Column two reveals that when age dummies are added to the regression as controls, the relationship between schooling and log wages does not change by much (the coefficient on schooling decreases from 0.132 to 0.131, with about the same returns to wages in US dollars per year of additional schooling as was estimated in a regression without the age dummies). Age does not appear to be correlated with schooling by very much.
+<br><br>
+However, column three reveals that when additional controls for family background and demographics are added to the regression (while still including age dummies), the coefficient on schooling decreases to a positive return of about 11.4 percentage points in wages, on average, per each additional year of schooling. This dramatic decrease tells us that the additional controls have a much more substantial, and positive, correlation with schooling.
+<br><br>
+Column four demonstrates that when all of these variables remain in the regression and the Armed Forces Qualification Test (AFQT) score is added as a control as well, the coefficient on schooling decreases further to 0.087. This regression estimates that holding these other variables constant, a one year increase in schooling is, on average, associated with an 8.7 percentage point increase in wages. Again, we observe that the AFQT score is positively correlated with schooling.
+<br><br>
+Column five reveals that when we add occupation dummies to the regression from column four, the relationship between schooling and wages weakens further. This regression estimates that on average, a one year increase in schooling is associated with a 6.6 percentage point increase in wages, holding the other variables in the regression constant. Again, occupation is positively correlated with schooling.
+<br><br>
+The differences between the coefficients in the shorter regressions and the long regression in column 5 are determined by the Omitted Variable Bias (OVB) formula:
+
+$$Given~a~regression~equation:~Y_i = α + ρs_i + A'_iγ + e_i: $$
+where *α*, *ρ*, and *γ* are population regression coefficients and *e~i~* is a regression residual that is uncorrelated with all regressors,
+
+$$Cov(Y_i,S_i)~/~V(S_i) = ρ + γ~'δ_{As},$$
+where *δ~As~* is the vector of coefficients from regressions of the elements of *A~i* on *s~i~*. This OVB formula states that the coefficient on the key independent variable (schooling) in a short regression is equal to a) the coefficient that would be estimated for that variable in a long regression, plus b) the coefficient that would result for the omitted variable in a long regression that includes it, multiplied by the coefficient estimated for the omitted variable in a regression of the omitted variable on the included variable.
+<br>
+Column five in MHE Table 3.2.1 is the long regression in the above explanation. Using the OVB formula, we can conclude that the coefficient on schooling in column one (0.132) suffers from OVB equal that inflates the naive estimate by about a 6.6 percentage point return to wages. This tells us that, as noted earlier in this question, there is a positive relationship between schooling and all of the variables omitted from the short regression:
+
+$$0.132 - 0.066 = γ~'δ_{As} = 0.066$$
+Comparing the results from the regression in column two to those of column five, we can conclude that the coefficient on schooling in column two (0.131) suffers from OVB that inflates the relevant naive estimate by about 6.5 percentage points:
+
+$$0.131 - 0.066 = γ~'δ_{As} = 0.065$$
+Next, comparing the results from the regression in column three to those of column five, we can conclude that the coefficient on schooling in column three (0.114) suffers from OVB that inflates the naive estimate by about 4.8 percentage points:
+
+$$0.114 - 0.066 = γ~'δ_{As} = 0.048$$
+Lastly, comparing the results from the regression in column four to those of column five, we can conclude that the coefficient on schooling in column four (0.087) suffers from OVB equal that inflates the naive estimate equal to about 2.1 percentage points:
+
+$$0.087 - 0.066 = γ~'δ_{As} = 0.021$$
+Each of the above calculations reflect a net positive relationship between the omitted variables and schooling as well as wages.
+
+# References
+
+I worked with classmate John McCabe for Question 1.1 in this assignment.
+
